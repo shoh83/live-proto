@@ -42,9 +42,10 @@ Start talking to Gemini
 import asyncio
 import sys
 import traceback
+import time
 from google.genai import types
 import pyaudio
-
+import wave
 from google import genai
 
 if sys.version_info < (3, 11, 0):
@@ -64,7 +65,7 @@ pya = pyaudio.PyAudio()
 
 client = genai.Client()  # GOOGLE_API_KEY must be set as env variable
 
-MODEL = "gemini-2.5-flash-preview-native-audio-dialog"
+MODEL = "gemini-live-2.5-flash-preview"
 CONFIG = types.LiveConnectConfig(
     response_modalities=[
         "AUDIO",
@@ -97,7 +98,18 @@ class AudioLoop:
 
         self.receive_audio_task = None
         self.play_audio_task = None
+        # Prepare for WAV output:
+        self.wav_out = wave.open("gemini_output.wav", "wb")
+        self.wav_out.setnchannels(CHANNELS)
+        # sample width in bytes (e.g. 2 for paInt16)
+        self.wav_out.setsampwidth(pya.get_sample_size(FORMAT))
+        self.wav_out.setframerate(RECEIVE_SAMPLE_RATE)
 
+         # — INPUT WAV (what you send *to* Gemini) —
+        self.wav_in = wave.open("gemini_input.wav", "wb")
+        self.wav_in.setnchannels(CHANNELS)
+        self.wav_in.setsampwidth(pya.get_sample_size(FORMAT))
+        self.wav_in.setframerate(SEND_SAMPLE_RATE)
 
     async def listen_audio(self):
         mic_info = pya.get_default_input_device_info()
@@ -110,13 +122,15 @@ class AudioLoop:
             input_device_index=mic_info["index"],
             frames_per_buffer=CHUNK_SIZE,
         )
-        print("대화를 시작합니다. 레스토랑 주문을 함께 연습합니다.")
         if __debug__:
             kwargs = {"exception_on_overflow": False}
         else:
             kwargs = {}
         while True:
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
+            # write each mic-chunk out to your input WAV
+            self.wav_in.writeframes(data)
+            # then send it on to Gemini
             await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
 
     async def send_realtime(self):
@@ -126,23 +140,34 @@ class AudioLoop:
 
     async def receive_audio(self):
         "Background task to reads from the websocket and write pcm chunks to the output queue"
-        while True:
-            turn = self.session.receive()
-            async for response in turn:
-                if data := response.data:
-                    self.audio_in_queue.put_nowait(data)
-                    continue
-                if text := response.text:
-                    print(text, end="")
+        try:
+            while True:
+                turn = self.session.receive()
+                async for response in turn:
+                    if data := response.data:
+                        # write raw PCM bytes to WAV file
+                        self.wav_out.writeframes(data)
+                        # enqueue for latency measurement/playback
+                        self.audio_in_queue.put_nowait((data, time.time()))
+                        continue
+                    if text := response.text:
+                        print(text, end="")
 
-            # If you interrupt the model, it sends a turn_complete.
-            # For interruptions to work, we need to stop playback.
-            # So empty out the audio queue because it may have loaded
-            # much more audio than has played yet.
-            # while not self.audio_in_queue.empty():
-            #     self.audio_in_queue.get_nowait()
+                # … your interruption logic …
+                # If you interrupt the model, it sends a turn_complete.
+                # For interruptions to work, we need to stop playback.
+                # So empty out the audio queue because it may have loaded
+                # much more audio than has played yet.
+                # while not self.audio_in_queue.empty():
+                #     self.audio_in_queue.get_nowait()
+        finally:
+            # Make sure we close the WAV file when done
+            self.wav_out.close()
+
+            
 
     async def play_audio(self):
+        # open output stream
         stream = await asyncio.to_thread(
             pya.open,
             format=FORMAT,
@@ -150,9 +175,30 @@ class AudioLoop:
             rate=RECEIVE_SAMPLE_RATE,
             output=True,
         )
+
+        # pre-buffer INITIAL_CHUNKS before playback
+        INITIAL_CHUNKS = int((RECEIVE_SAMPLE_RATE * 0.1) / CHUNK_SIZE)  # ~100 ms
+        startup_buffer = []
+        for _ in range(INITIAL_CHUNKS):
+            item = await self.audio_in_queue.get()
+            # unpack tuple or raw
+            chunk = item[0] if isinstance(item, tuple) else item
+            startup_buffer.append(chunk)
+
+        # play buffered chunks
+        for chunk in startup_buffer:
+            await asyncio.to_thread(stream.write, chunk)
+
+        # continuous playback
         while True:
-            bytestream = await self.audio_in_queue.get()
-            await asyncio.to_thread(stream.write, bytestream)
+            item = await self.audio_in_queue.get()
+            chunk = item[0] if isinstance(item, tuple) else item
+            # optional latency log
+            if isinstance(item, tuple):
+                ts = item[1]
+                latency_ms = (time.time() - ts) * 1000
+                print(f"[Latency] {latency_ms:.1f} ms")
+            await asyncio.to_thread(stream.write, chunk)
 
     async def run(self):
         try:
