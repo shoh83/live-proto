@@ -45,6 +45,7 @@ import traceback
 from google.genai import types
 import pyaudio
 
+import wave
 from google import genai
 
 if sys.version_info < (3, 11, 0):
@@ -97,6 +98,18 @@ class AudioLoop:
 
         self.receive_audio_task = None
         self.play_audio_task = None
+        # Prepare for WAV output:
+        self.wav_out = wave.open("response.wav", "wb")
+        self.wav_out.setnchannels(CHANNELS)
+        # sample width in bytes (e.g. 2 for paInt16)
+        self.wav_out.setsampwidth(pya.get_sample_size(FORMAT))
+        self.wav_out.setframerate(RECEIVE_SAMPLE_RATE)
+
+         # — INPUT WAV (what you send *to* Gemini) —
+        self.wav_in = wave.open("user_input.wav", "wb")
+        self.wav_in.setnchannels(CHANNELS)
+        self.wav_in.setsampwidth(pya.get_sample_size(FORMAT))
+        self.wav_in.setframerate(SEND_SAMPLE_RATE)
 
 
     async def listen_audio(self):
@@ -117,6 +130,9 @@ class AudioLoop:
             kwargs = {}
         while True:
             data = await asyncio.to_thread(self.audio_stream.read, CHUNK_SIZE, **kwargs)
+            # write each mic-chunk out to your input WAV
+            self.wav_in.writeframes(data)
+            # then send it on to Gemini
             await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
 
     async def send_realtime(self):
@@ -126,21 +142,30 @@ class AudioLoop:
 
     async def receive_audio(self):
         "Background task to reads from the websocket and write pcm chunks to the output queue"
-        while True:
-            turn = self.session.receive()
-            async for response in turn:
-                if data := response.data:
-                    self.audio_in_queue.put_nowait(data)
-                    continue
-                if text := response.text:
-                    print(text, end="")
+        try:
+            while True:
+                turn = self.session.receive()
+                async for response in turn:
+                    if data := response.data:
+                        # write raw PCM bytes to WAV file
+                        self.wav_out.writeframes(data)
+                        # enqueue for latency measurement/playback
+                        self.audio_in_queue.put_nowait(data)
+                        continue
+                    if text := response.text:
+                        print(text, end="")
 
-            # If you interrupt the model, it sends a turn_complete.
-            # For interruptions to work, we need to stop playback.
-            # So empty out the audio queue because it may have loaded
-            # much more audio than has played yet.
-            # while not self.audio_in_queue.empty():
-            #     self.audio_in_queue.get_nowait()
+                # … your interruption logic …
+                # If you interrupt the model, it sends a turn_complete.
+                # For interruptions to work, we need to stop playback.
+                # So empty out the audio queue because it may have loaded
+                # much more audio than has played yet.
+                # while not self.audio_in_queue.empty():
+                #     self.audio_in_queue.get_nowait()
+        finally:
+            # Make sure we close the WAV file when done
+            self.wav_out.close()
+
 
     async def play_audio(self):
         stream = await asyncio.to_thread(
