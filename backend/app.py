@@ -1,6 +1,6 @@
 # app.py
 # -*- coding: utf-8 -*-
-
+import json
 import asyncio
 import traceback
 import wave
@@ -8,6 +8,7 @@ import websockets
 import pyaudio
 from google import genai
 from google.genai import types
+from websockets.exceptions import ConnectionClosedError
 
 # Audio & file constants
 FORMAT    = pyaudio.paInt16
@@ -15,30 +16,29 @@ CHANNELS  = 1
 SEND_SR   = 16000
 RECV_SR   = 24000
 
-INPUT_WAV    = 'user_input.wav'
-RESPONSE_WAV = 'response.wav'
+INPUT_WAV    = '/Users/seung/Desktop/user_input.wav'
+RESPONSE_WAV = '/Users/seung/Desktop/response.wav'
 
 # Initialize PyAudio and GenAI client
 audio_engine = pyaudio.PyAudio()
 client       = genai.Client()  # Make sure GOOGLE_API_KEY is set
 
-PROMPT = """You are an approachable, patient English tutor specializing in beginner Korean speakers. Today’s lesson is a simulated airport check-in where you play the role of Hawaiian Airlines staff helping a passenger check in for their flight.
+PROMPT = """You are an approachable, patient English tutor specializing in beginner Korean speakers. Today’s lesson is a simulated airport check-in at John F. Kennedy International Airport (JFK) where you play the role of Delta Air Lines staff helping a passenger check in for their flight. Make sure you speak very slowly for a beginner to understand what you say. Give a one- to two-second pause between sentences.
 
 1. Set the scene
-– Describe the setting: “You’ve arrived at the departure hall of Daniel K. Inouye International Airport in Honolulu. You’re at the Hawaiian Airlines check-in counter.”
+– Describe the setting: “You’ve arrived at the departure hall of JFK in Queens, New York. You’re standing at the Delta Air Lines check-in counter in Terminal 2.”
 
 2. Model key phrases
 – Introduce essential expressions in context:
- - Staff: “Aloha! Welcome to Hawaiian Airlines. May I see your passport and confirmation code?”
+ - Staff: “Good morning! Welcome to Delta Air Lines. May I see your passport and confirmation code?”
  - Staff: “How many bags will you be checking today?”
  - Staff: “Would you like an aisle seat or a window seat with an ocean view?”
  - Staff: “Here’s your boarding pass. Your gate is C3, and boarding begins at 3:45 PM.”
 
 3. Elicit learner speech
 – Prompt the student to respond step by step:
-
-Tutor: “What would you say in English if you want to change your seat?”
-Tutor: “Now ask if there’s a fee for extra baggage.”
+ - Tutor: “What would you say in English if you want to change your seat?”
+ - Tutor: “Now ask if there’s a fee for extra baggage.”
 
 4. Expand and vary
 – After each learner attempt, offer synonyms and alternatives:
@@ -50,10 +50,13 @@ Tutor: “Now ask if there’s a fee for extra baggage.”
 – Swap roles: the student becomes the staff and asks you, the passenger, for information (e.g., “How many bags will you be checking?”).
 
 7. Wrap up and review
-– Summarize the key phrases learned and encourage a final mini role-play combining all steps: checking in, choosing a seat, and confirming the boarding details."""
+– Summarize the key phrases learned and encourage a final mini role-play combining all steps: checking in, choosing a seat, and confirming the boarding details.
+
+Goal: Provide step-by-step guidance through realistic interactions at a Delta Air Lines check-in counter at JFK, building confidence with authentic travel-related English expressions."""
 
 # Gemini LiveConnect configuration
 MODEL  = 'gemini-2.5-flash-preview-native-audio-dialog'
+# MODEL  = 'gemini-live-2.5-flash-preview'
 CONFIG = types.LiveConnectConfig(
     response_modalities=['AUDIO'],
     media_resolution='MEDIA_RESOLUTION_LOW',
@@ -96,10 +99,28 @@ class AudioLoop:
         """
         Read raw PCM from the browser, record it, and enqueue for Gemini.
         """
-        async for chunk in self.ws:
+        async for msg in self.ws:
+            # 1) JSON control frames
+            if isinstance(msg, str):
+                try:
+                    ctrl = json.loads(msg)
+                except json.JSONDecodeError:
+                    continue
+
+                if ctrl.get('cmd') == 'text' and 'text' in ctrl:
+                    # send a text turn immediately, marking it as complete
+                    await self.session.send_client_content(
+                        turns={'role': 'user',
+                               'parts': [{'text': ctrl['text']}]},
+                        turn_complete=True
+                    )
+                    continue
+
+            # 2) binary = raw PCM chunk
+            #    record it and enqueue for streaming to Gemini
             # chunk is bytes of Int16 PCM @16kHz
-            self.wav_in.writeframes(chunk)
-            await self.audio_out_q.put({'data': chunk, 'mime_type': 'audio/pcm'})
+            self.wav_in.writeframes(msg)
+            await self.audio_out_q.put({'data': msg, 'mime_type': 'audio/pcm'})
 
     async def send_realtime(self):
         """
@@ -118,14 +139,32 @@ class AudioLoop:
             while True:
                 turn = self.session.receive()
                 async for response in turn:
+                    # Detect server‐side VAD interruption
+                    if getattr(response, "server_content", None):
+                        if response.server_content.interrupted:
+                            # Notify client to flush playback
+                            await self.ws.send(json.dumps({"interrupted": True}))
+                            # skip any further data in this turn
+                            break
+
                     if response.data:
                         # record to response.wav
                         self.wav_out.writeframes(response.data)
+                        try:
                         # forward to client
-                        await self.ws.send(response.data)
-        finally:
-            # WAV files are closed in the handler’s cleanup
-            pass
+                            await self.ws.send(response.data)
+                        except ConnectionClosedOK:
+                            # Client closed the WebSocket (1005); stop sending
+                            return
+        except ConnectionClosedError as e:
+            # transient internal error from Gemini Live API; swallow and let handler clean up
+            print(f"[Warning] LiveConnect connection closed: {e}")
+        except Exception as e:
+            # any other unexpected exception
+            traceback.print_exception(e)
+        # finally:
+        #     # WAV files are closed in the handler’s cleanup
+        #     pass
 
     def close(self):
         """Close both WAV files once all tasks are done."""
